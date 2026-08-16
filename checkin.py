@@ -122,7 +122,7 @@ class GLaDOS:
 
         if res and res.get("code") == -2:
             self.error = "Cookie无权限，请重新获取Cookie"
-             self.cookie_status = "❌失效"
+            self.cookie_status = "❌失效"
             return False
 
         if res and 'data' in res:
