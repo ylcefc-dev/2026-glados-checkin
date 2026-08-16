@@ -83,6 +83,7 @@ class GLaDOS:
     def __init__(self, cookie):
         self.plan = "?"
         self.error = ""
+        self.cookie_status = "❓未知"
         self.cookie = cookie
         self.domain = DOMAINS[0]
         self.email = "?"
@@ -121,9 +122,11 @@ class GLaDOS:
 
         if res and res.get("code") == -2:
             self.error = "Cookie无权限，请重新获取Cookie"
+             self.cookie_status = "❌失效"
             return False
 
         if res and 'data' in res:
+            self.cookie_status = "✅正常"
             d = res['data']
             self.email = d.get('email', 'Unknown')
             self.left_days = str(d.get('leftDays', '?')).split('.')[0]
@@ -286,12 +289,13 @@ def main():
         status_icon = "✅" if "Checkin" in msg else "⚠️"
         log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
         
-        if "Checkin" in msg: success_cnt += 1
-        
+        if not g.error:
+            success_cnt += 1
         # 4. Result Formatting
         results.append(f"""
 <div style="border:2px solid #333; padding:15px; margin-bottom:15px; border-radius:10px; background:#fff;">
     <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #333; padding-bottom:8px;">👤 {g.email}</h3>
+    <p style="margin:8px 0; color:#000; font-size:16px;"><b>🔐 Cookie状态:</b> {g.cookie_status}</p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>当前积分:</b> <span style="color:#e74c3c; font-size:22px; font-weight:bold;">{g.points}</span> <span style="color:#27ae60; font-weight:bold;">({g.points_change})</span></p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>剩余天数:</b> <span style="font-weight:bold;">{g.left_days} 天</span></p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>签到结果:</b> {msg}</p>
