@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # Fix Windows Unicode Output
 if sys.platform.startswith('win'):
@@ -40,7 +40,9 @@ HEADERS = {
 # ================= 工具函数 =================
 
 def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now(
+        timezone(timedelta(hours=8))
+    ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
 
 def extract_cookie(raw: str):
@@ -122,8 +124,12 @@ class GLaDOS:
         return False
 
     def get_points(self):
-        """获取积分、变化历史、兑换计划"""
-        res = self.req('GET', '/api/user/points')
+    """获取积分、变化历史、兑换计划"""
+    res = self.req('GET', '/api/user/points')
+
+    log("========== POINT API返回 ==========")
+    log(json.dumps(res, ensure_ascii=False))
+    log("===================================")
         if res and 'points' in res:
             # 当前积分
             self.points = str(res.get('points', '0')).split('.')[0]
@@ -267,7 +273,7 @@ def main():
     if ptoken or (tg_token and tg_chat_id):
         title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
         content = "".join(results)
-        content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
+        content += f"<br><small>时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}</small>"
         
         if ptoken:
             pushplus(ptoken, title, content)
