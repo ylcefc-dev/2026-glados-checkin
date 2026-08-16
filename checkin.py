@@ -124,12 +124,48 @@ class GLaDOS:
         return False
 
     def get_points(self):
-    """获取积分、变化历史、兑换计划"""
-    res = self.req('GET', '/api/user/points')
+        """获取积分、变化历史、兑换计划"""
+        res = self.req('GET', '/api/user/points')
 
-    log("========== POINT API返回 ==========")
-    log(json.dumps(res, ensure_ascii=False))
-    log("===================================")
+        log("========== POINT API返回 ==========")
+        log(json.dumps(res, ensure_ascii=False))
+        log("===================================")
+
+        if res and 'points' in res:
+            # 当前积分
+            self.points = str(res.get('points', '0')).split('.')[0]
+            
+            # 最近一次积分变化
+            history = res.get('history', [])
+            if history:
+                last = history[0]
+                change = str(last.get('change', '0')).split('.')[0]
+                if not change.startswith('-'):
+                    change = '+' + change
+                self.points_change = change
+            
+            # 兑换计划
+            plans = res.get('plans', {})
+            pts = int(self.points)
+            exchange_lines = []
+
+            for plan_id, plan_data in plans.items():
+                need = plan_data['points']
+                days = plan_data['days']
+
+                if pts >= need:
+                    exchange_lines.append(
+                        f"✅ {need}分→{days}天 (可兑换)"
+                    )
+                else:
+                    exchange_lines.append(
+                        f"❌ {need}分→{days}天 (差{need-pts}分)"
+                    )
+
+            self.exchange_info = "<br>".join(exchange_lines)
+            return True
+
+        return False
         if res and 'points' in res:
             # 当前积分
             self.points = str(res.get('points', '0')).split('.')[0]
