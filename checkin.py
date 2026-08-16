@@ -81,6 +81,8 @@ def get_cookies():
 
 class GLaDOS:
     def __init__(self, cookie):
+        self.plan = "?"
+        self.error = ""
         self.cookie = cookie
         self.domain = DOMAINS[0]
         self.email = "?"
@@ -116,11 +118,17 @@ class GLaDOS:
     def get_status(self):
         """获取状态：天数、邮箱"""
         res = self.req('GET', '/api/user/status')
+
+        if res and res.get("code") == -2:
+            self.error = "Cookie无权限，请重新获取Cookie"
+            return False
+
         if res and 'data' in res:
             d = res['data']
             self.email = d.get('email', 'Unknown')
             self.left_days = str(d.get('leftDays', '?')).split('.')[0]
             return True
+
         return False
 
     def get_points(self):
