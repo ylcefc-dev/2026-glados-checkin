@@ -1,24 +1,42 @@
 name: Keep Repository Active
 
-# 每天 UTC 0:00 运行一次
+# 每天 UTC 0:00（北京 8:00）运行
 on:
   schedule:
     - cron: '0 0 * * *'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 用于提交时间戳
+  actions: write    # 用于自动重新启用被 GitHub 禁用的工作流
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 【关键加固】GitHub 会在仓库 60 天无活动后自动禁用 schedule 工作流，
+      # 一旦被禁用，cron-job.org 的 workflow_dispatch 也会一起失效（返回 Workflow is disabled）。
+      # 这里每天检查并自动 enable，实现自愈。
+      - name: Re-enable disabled workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for wf in checkin.yml keep-alive.yml; do
+            state=$(gh api "repos/$GH_REPO/actions/workflows/$wf" --jq '.state' 2>/dev/null || echo "unknown")
+            echo "$wf -> $state"
+            if [ "$state" != "active" ] && [ "$state" != "unknown" ]; then
+              gh api -X PUT "repos/$GH_REPO/actions/workflows/$wf/enable" \
+                && echo "✅ 已重新启用 $wf" || echo "❌ 启用 $wf 失败"
+            fi
+          done
+
       - name: Update timestamp
         run: |
-          # 更新一个时间戳文件来保持仓库活跃
           echo "Last active: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" > .github/last-active.txt
 
       - name: Commit changes
