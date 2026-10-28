@@ -3,12 +3,16 @@
 """
 2026 GLaDOS 自动签到 (积分增强版)
 
-功能：
-- 全自动签到
-- 精准获取当前积分 (Points)
-- PushPlus 微信推送 / Telegram 推送（包含积分、剩余天数、签到结果）
-- 智能多域名切换 (优先 glados.cloud)
-- 支持 Cookie-Editor 导出格式
+v1.3.0 变更（失败可见 + 判定修正 + 重试真正生效）：
+- 签到成败以接口返回为准：不再用「g.error 为空即成功」这种假判定
+  旧逻辑下，请求彻底失败（返回 None）也会被计为成功，于是 job 永远是绿的
+- Cookie 失效单独识别（code == -2 / message 含「没有权限」），
+  直接打 error annotation + 写摘要，并退出码 2（致命，重试无意义）
+- 可重试类失败（网络、5xx、超时）在脚本内部重试 3 次（20s/40s 退避），
+  因此工作流里的 Retry 步骤可以去掉，避免重复推送
+- 退出码语义：0 全部成功 / 1 可重试失败 / 2 凭据或配置错误（不可重试）
+- 失败时打印接口原始响应（已脱敏、截断），下次出问题不用再猜
+- 多账号时任一账号失败即整体判失败，不会出现「1 成功 1 失败却报 2/2」
 
 v1.2.0 变更（推送可靠性）：
 - 推送结果不再静默：成功/失败都会写入 Actions Step Summary 并生成 error annotation
@@ -23,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 
 # Fix Windows Unicode Output
@@ -32,6 +37,7 @@ if sys.platform.startswith('win'):
 # ================= 配置 =================
 
 # 域名优先级：Cloud 第一
+# 注：glados.network 在当前网络下存在 DNS 污染，实测经常连不上，仅作最后兜底
 DOMAINS = [
     "https://glados.cloud",
     "https://glados.rocks",
@@ -44,7 +50,20 @@ HEADERS = {
     'Accept': 'application/json, text/plain, */*',
 }
 
-TG_MAX_LEN = 4000  # Telegram 单条上限 4096，留点余量
+TG_MAX_LEN = 4000        # Telegram 单条上限 4096，留点余量
+RETRY_TIMES = 3          # 可重试失败的尝试次数（含首次）
+RETRY_BACKOFF = 20       # 秒，第 n 次失败后等待 n * RETRY_BACKOFF
+
+# 视为「今天已经签过」的返回文案 —— 不算失败
+ALREADY_DONE_KEYWORDS = ("Try Tomorrow", "already", "已签到", "明天")
+
+# 视为 Cookie 失效的返回文案
+AUTH_FAIL_KEYWORDS = ("没有权限", "无权限", "unauthorized", "forbidden")
+
+# 退出码
+EXIT_OK = 0
+EXIT_RETRYABLE = 1
+EXIT_FATAL = 2
 
 # ================= 工具函数 =================
 
@@ -52,15 +71,17 @@ def log(msg):
     ts = datetime.now(
         timezone(timedelta(hours=8))
     ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}] {msg}", flush=True)
 
 def redact(text):
-    """隐藏 bot token，避免 requests 异常把 token 带进公开日志"""
-    return re.sub(r"(bot\d+:)[A-Za-z0-9_\-]+", r"\1***", str(text))
+    """隐藏 bot token 与 Cookie，避免 requests 异常把凭据带进公开日志"""
+    text = re.sub(r"(bot\d+:)[A-Za-z0-9_\-]+", r"\1***", str(text))
+    text = re.sub(r"(koa[:.]sess[^=]*=)[^;\s\"']+", r"\1***", text)
+    return text
 
 def annotate(level, msg):
     """GitHub Actions annotation：在运行页面顶部直接显示错误"""
-    print(f"::{level}::{msg}")
+    print(f"::{level}::{msg}", flush=True)
 
 def summary(markdown):
     """写入 Actions Step Summary，跑完在运行页首屏可见"""
@@ -75,7 +96,8 @@ def summary(markdown):
 
 def extract_cookie(raw: str):
     """提取 Cookie，支持 Cookie-Editor 冒号格式"""
-    if not raw: return None
+    if not raw:
+        return None
     raw = raw.strip()
 
     # Cookie-Editor 格式 (koa:sess=xxx; koa:sess.sig=yyy)
@@ -85,8 +107,9 @@ def extract_cookie(raw: str):
     # JSON
     if raw.startswith('{'):
         try:
-            return 'koa.sess=' + json.loads(raw).get('token')
-        except: pass
+            return 'koa:sess=' + json.loads(raw).get('token')
+        except Exception:
+            pass
 
     # JWT Token
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
@@ -101,9 +124,12 @@ def get_cookies():
         log("❌ 未配置 GLADOS_COOKIE")
         return []
 
-    # Split by enter or &
-    sep = '\n' if '\n' in raw else '&'
-    return [extract_cookie(c) for c in raw.split(sep) if c.strip()]
+    # 多账号分隔：优先按 & 分隔；仅当没有 & 且存在换行时才按换行拆
+    if '&' in raw:
+        parts = raw.split('&')
+    else:
+        parts = raw.split('\n')
+    return [extract_cookie(c) for c in parts if c.strip()]
 
 # ================= 核心逻辑 =================
 
@@ -111,6 +137,7 @@ class GLaDOS:
     def __init__(self, cookie):
         self.plan = "?"
         self.error = ""
+        self.auth_failed = False       # Cookie 失效（致命，重试无意义）
         self.cookie_status = "❓未知"
         self.cookie = cookie
         self.domain = DOMAINS[0]
@@ -119,10 +146,13 @@ class GLaDOS:
         self.points = "?"
         self.points_change = "?"
         self.exchange_info = ""
+        self.last_raw = ""
 
     def req(self, method, path, data=None):
-        """带自动域名切换的请求"""
-        for d in DOMAINS:
+        """带自动域名切换的请求；返回 (ok, body)。网络/5xx 视为可重试"""
+        # 上次成功的域名优先，减少无谓超时
+        ordered = [self.domain] + [d for d in DOMAINS if d != self.domain]
+        for d in ordered:
             try:
                 url = f"{d}{path}"
                 h = HEADERS.copy()
@@ -131,28 +161,39 @@ class GLaDOS:
                 h['Referer'] = f"{d}/console/checkin"
 
                 if method == 'GET':
-                    resp = requests.get(url, headers=h, timeout=10)
+                    resp = requests.get(url, headers=h, timeout=15)
                 else:
-                    resp = requests.post(url, headers=h, json=data, timeout=10)
+                    resp = requests.post(url, headers=h, json=data, timeout=15)
 
                 if resp.status_code == 200:
-                    self.domain = d # Remember working domain
-                    return resp.json()
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        log(f"⚠️ {d} 返回非 JSON: {redact(resp.text)[:120]}")
+                        continue
+                    self.domain = d
+                    self.last_raw = json.dumps(body, ensure_ascii=False)[:300]
+                    return True, body
+
+                log(f"⚠️ {d} HTTP {resp.status_code}: {redact(resp.text)[:120]}")
             except Exception as e:
-                log(f"⚠️ {d} 请求失败: {e}")
+                log(f"⚠️ {d} 请求失败: {redact(e)}")
                 continue
-        return None
+        return False, None
 
     def get_status(self):
         """获取状态：天数、邮箱"""
-        res = self.req('GET', '/api/user/status')
-
-        if res and res.get("code") == -2:
-            self.error = "Cookie无权限，请重新获取Cookie"
-            self.cookie_status = "❌失效"
+        ok, res = self.req('GET', '/api/user/status')
+        if not ok or not isinstance(res, dict):
             return False
 
-        if res and 'data' in res:
+        if res.get("code") == -2:
+            self.error = "Cookie无权限，请重新获取Cookie"
+            self.cookie_status = "❌失效"
+            self.auth_failed = True
+            return False
+
+        if 'data' in res:
             self.cookie_status = "✅正常"
             d = res['data']
             self.email = d.get('email', 'Unknown')
@@ -163,9 +204,15 @@ class GLaDOS:
 
     def get_points(self):
         """获取积分、变化历史、兑换计划"""
-        res = self.req('GET', '/api/user/points')
+        ok, res = self.req('GET', '/api/user/points')
+        if not ok or not isinstance(res, dict):
+            return False
 
-        if not (res and 'points' in res):
+        if res.get("code") == -2:
+            self.auth_failed = True
+            return False
+
+        if 'points' not in res:
             return False
 
         # 当前积分
@@ -200,8 +247,30 @@ class GLaDOS:
         return True
 
     def checkin(self):
-        """执行签到"""
-        return self.req('POST', '/api/user/checkin', {'token': 'glados.cloud'})
+        """执行签到；返回 (state, msg)
+        state: 'ok' | 'already' | 'auth' | 'fail'
+        """
+        ok, res = self.req('POST', '/api/user/checkin', {'token': 'glados.cloud'})
+        if not ok or not isinstance(res, dict):
+            return 'fail', 'Network Error'
+
+        msg = str(res.get('message', '') or '')
+        code = res.get('code')
+
+        # 1) 凭据失效：任何后续重试都不会成功
+        if code == -2 or any(k.lower() in msg.lower() for k in AUTH_FAIL_KEYWORDS):
+            return 'auth', msg or '没有权限'
+
+        # 2) 今天已签过：视为成功，不是故障
+        if any(k.lower() in msg.lower() for k in ALREADY_DONE_KEYWORDS):
+            return 'already', msg or 'Please Try Tomorrow'
+
+        # 3) 正常成功：GLaDOS 成功时 code 为 0
+        if code == 0:
+            return 'ok', msg or 'Checkin OK'
+
+        # 4) 其余一律算失败，把原始 message 带出来
+        return 'fail', msg or f'Failure (code={code})'
 
 # ================= 推送 =================
 
@@ -312,41 +381,78 @@ def telegram_push(token, chat_id, title, content):
 
 # ================= 主程序 =================
 
+COOKIE_FIX_HINT = (
+    "Cookie 已失效，需要人工更新："
+    "浏览器登录 https://glados.cloud/console/checkin → F12 → Application → Cookies "
+    "→ 复制 koa:sess 与 koa:sess.sig → 拼成 \"koa:sess=…; koa:sess.sig=…\" "
+    "→ 更新仓库 Secret GLADOS_COOKIE → 手动运行一次 checkin 工作流验证"
+)
+
+
+def checkin_with_retry(g):
+    """单账号签到，可重试类失败自动重试；返回 (state, msg)"""
+    state, msg = 'fail', 'Network Error'
+    for attempt in range(1, RETRY_TIMES + 1):
+        state, msg = g.checkin()
+        if state in ('ok', 'already', 'auth'):
+            return state, msg
+        if attempt < RETRY_TIMES:
+            wait = RETRY_BACKOFF * attempt
+            log(f"🔁 第 {attempt} 次签到失败（{msg}），{wait}s 后重试")
+            time.sleep(wait)
+    return state, msg
+
+
 def main():
-    log("🚀 2026 GLaDOS Checkin Starting...")
+    log("🚀 2026 GLaDOS Checkin Starting... (v1.3.0)")
     cookies = get_cookies()
     if not cookies:
         annotate("error", "未配置 GLADOS_COOKIE，无法签到")
-        sys.exit(1)
+        summary("## GLaDOS 签到结果\n\n- ❌ 未配置 `GLADOS_COOKIE`，无法签到")
+        return EXIT_FATAL
 
     results = []
-    success_cnt = 0
+    ok_cnt = 0
+    auth_failed = False
+    retryable = False
 
     for i, cookie in enumerate(cookies, 1):
         g = GLaDOS(cookie)
 
-        # 1. Checkin
-        res = g.checkin()
-        msg = res.get('message', 'Failure') if res else "Network Error"
+        # 1. Checkin（含内部重试）
+        state, msg = checkin_with_retry(g)
 
         # 2. Get Info (Refresh data)
         g.get_status()
         g.get_points()
 
         # 3. Log
-        log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
+        log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {state}/{msg}")
 
-        if not g.error:
-            success_cnt += 1
+        # 4. 统计
+        if state in ('ok', 'already'):
+            ok_cnt += 1
+        elif state == 'auth' or g.auth_failed:
+            auth_failed = True
+            g.cookie_status = "❌失效"
+        else:
+            retryable = True
 
-        # 4. Result Formatting
+        if state == 'auth' or g.auth_failed:
+            result_line = f"{msg}（Cookie 失效）"
+        elif state == 'already':
+            result_line = f"{msg}（今日已签到）"
+        else:
+            result_line = msg
+
+        # 5. Result Formatting
         results.append(f"""
 <div style="border:2px solid #333; padding:15px; margin-bottom:15px; border-radius:10px; background:#fff;">
     <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #333; padding-bottom:8px;">👤 {g.email}</h3>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>🔐 Cookie状态:</b> {g.cookie_status}</p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>当前积分:</b> <span style="color:#e74c3c; font-size:22px; font-weight:bold;">{g.points}</span> <span style="color:#27ae60; font-weight:bold;">({g.points_change})</span></p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>剩余天数:</b> <span style="font-weight:bold;">{g.left_days} 天</span></p>
-    <p style="margin:8px 0; color:#000; font-size:16px;"><b>签到结果:</b> {msg}</p>
+    <p style="margin:8px 0; color:#000; font-size:16px;"><b>签到结果:</b> {result_line}</p>
     <div style="margin-top:15px; padding:12px; background:#f0f0f0; border-radius:8px; border:1px solid #ccc;">
         <p style="margin:0 0 8px 0; color:#333; font-weight:bold; font-size:15px;">🎁 兑换选项:</p>
         <p style="margin:0; color:#000; font-size:14px; line-height:1.8;">
@@ -368,15 +474,24 @@ def main():
     if not has_pp and not has_tg:
         annotate("error", "未配置任何推送渠道（TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID 或 PUSHPLUS_TOKEN），本次结果不会推送")
 
+    if auth_failed:
+        annotate("error", COOKIE_FIX_HINT)
+
     push_level = os.environ.get("PUSH_LEVEL", "all").lower()
+    all_ok = (ok_cnt == len(cookies))
 
-    if push_level == "fail_only" and success_cnt == len(cookies):
+    if push_level == "fail_only" and all_ok:
         log("⏭️ 根据 PUSH_LEVEL=fail_only 设置，所有账号签到成功，跳过推送")
-        summary(f"## GLaDOS 签到\n\n- 结果：**{success_cnt}/{len(cookies)}** 全部成功\n- 推送：按 `PUSH_LEVEL=fail_only` 跳过")
-        return
+        summary(f"## GLaDOS 签到\n\n- 结果：**{ok_cnt}/{len(cookies)}** 全部成功\n- 推送：按 `PUSH_LEVEL=fail_only` 跳过")
+        return EXIT_OK
 
-    title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
+    title = f"GLaDOS签到: 成功{ok_cnt}/{len(cookies)}"
+    if auth_failed:
+        title += " · Cookie失效"
     content = "".join(results)
+    if auth_failed:
+        content += ("<br><b>⚠️ Cookie 已失效</b>：请重新登录 glados.cloud 导出 koa:sess / koa:sess.sig，"
+                    "更新仓库 Secret GLADOS_COOKIE 后手动运行一次。")
     content += f"<br><small>时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}</small>"
 
     outcome = {}
@@ -389,13 +504,26 @@ def main():
     lines = [
         "## GLaDOS 签到结果",
         "",
-        f"- 账号：**{success_cnt}/{len(cookies)}** 正常",
+        f"- 账号：**{ok_cnt}/{len(cookies)}** 成功",
     ]
+    if auth_failed:
+        lines.append("- ❌ **Cookie 已失效**，本次签到无效，需人工更新 Secret `GLADOS_COOKIE`")
     for name, ok in outcome.items():
         lines.append(f"- {name} 推送：{'✅ 成功' if ok else '❌ 失败'}")
         if not ok:
             annotate("error", f"{name} 推送失败，请检查 Secrets 配置与机器人状态")
     summary("\n".join(lines))
 
+    # ===== 退出码：让 job 真实反映结果 =====
+    if auth_failed:
+        log("❌ 退出码 2：Cookie 失效，重试无意义")
+        return EXIT_FATAL
+    if not all_ok:
+        log("❌ 退出码 1：签到未全部成功，可重试")
+        return EXIT_RETRYABLE
+    log("✅ 退出码 0：全部成功")
+    return EXIT_OK
+
+
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

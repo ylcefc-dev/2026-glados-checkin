@@ -28,21 +28,10 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
+      # v1.3.0 起，重试逻辑内置在 checkin.py 里（仅对网络/5xx 重试，Cookie 失效不重试），
+      # 因此原来的「Retry on Failure」步骤已移除，避免同一结果被推送两次。
       - name: Run Checkin
         run: python checkin.py
-        timeout-minutes: 5
-        env:
-          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-      - name: Retry on Failure
-        if: failure()
-        run: |
-          echo "First attempt failed, retrying in 60s..."
-          sleep 60
-          python checkin.py
         timeout-minutes: 5
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
