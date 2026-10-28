@@ -95,28 +95,29 @@ def summary(markdown):
         pass
 
 def with_alias(cookie: str) -> str:
-    """同一会话值同时以 gladss 与 koa:sess 两种命名发送
+    """同一会话值同时以三种命名发送，兼容 GLaDOS 各版本的服务端
 
-    GLaDOS 新版会话 Cookie 名为 gladss / gladss.sig，旧版为 koa:sess / koa:sess.sig。
-    两种命名同时带上，服务端认哪个用哪个，Secret 里写哪种格式都能跑。
+    实测（2026-10-28）：当前线上使用 gld:sess / gld:sess.sig；
+    更早的文档与脚本使用 koa:sess / koa:sess.sig；另见 gladss 写法。
+    三种命名同时带上，服务端认哪个用哪个，Secret 里写哪种格式都能跑。
     """
     if not cookie:
         return cookie
     found = re.findall(r"([A-Za-z0-9_.:]+)\s*=\s*([^;\s]+)", cookie)
     if not found:
         return cookie
+
     d = {k.replace("koa.sess", "koa:sess"): v for k, v in found}
-    sess = d.get("koa:sess") or d.get("gladss")
-    sig = d.get("koa:sess.sig") or d.get("gladss.sig")
+    sess = d.get("gld:sess") or d.get("koa:sess") or d.get("gladss")
+    sig = d.get("gld:sess.sig") or d.get("koa:sess.sig") or d.get("gladss.sig")
     if not sess:
         return cookie
 
-    parts = [f"gladss={sess}"]
-    if sig:
-        parts.append(f"gladss.sig={sig}")
-    parts.append(f"koa:sess={sess}")
-    if sig:
-        parts.append(f"koa:sess.sig={sig}")
+    parts = []
+    for name in ("gld:sess", "gladss", "koa:sess"):
+        parts.append(f"{name}={sess}")
+        if sig:
+            parts.append(f"{name}.sig={sig}")
     return "; ".join(parts)
 
 def extract_cookie(raw: str):
@@ -410,7 +411,7 @@ COOKIE_FIX_HINT = (
     "Cookie 已失效，需要人工更新："
     "浏览器登录 https://glados.cloud/console/checkin（先确认页面能正常显示账号，若跳回首页说明会话已失效需重新登录）"
     "→ F12 → Network → 刷新 → 点任意 api 请求 → Request Headers → 复制 Cookie 整行"
-    "（新版 Cookie 名为 gladss / gladss.sig，旧版为 koa:sess / koa:sess.sig，两种都支持）"
+    "（当前线上 Cookie 名为 gld:sess / gld:sess.sig，脚本同时兼容 gladss 与 koa:sess 写法）"
     "→ 更新仓库 Secret GLADOS_COOKIE → 手动运行一次 checkin 工作流验证"
 )
 
