@@ -94,29 +94,54 @@ def summary(markdown):
     except Exception:
         pass
 
+def with_alias(cookie: str) -> str:
+    """同一会话值同时以 gladss 与 koa:sess 两种命名发送
+
+    GLaDOS 新版会话 Cookie 名为 gladss / gladss.sig，旧版为 koa:sess / koa:sess.sig。
+    两种命名同时带上，服务端认哪个用哪个，Secret 里写哪种格式都能跑。
+    """
+    if not cookie:
+        return cookie
+    found = re.findall(r"([A-Za-z0-9_.:]+)\s*=\s*([^;\s]+)", cookie)
+    if not found:
+        return cookie
+    d = {k.replace("koa.sess", "koa:sess"): v for k, v in found}
+    sess = d.get("koa:sess") or d.get("gladss")
+    sig = d.get("koa:sess.sig") or d.get("gladss.sig")
+    if not sess:
+        return cookie
+
+    parts = [f"gladss={sess}"]
+    if sig:
+        parts.append(f"gladss.sig={sig}")
+    parts.append(f"koa:sess={sess}")
+    if sig:
+        parts.append(f"koa:sess.sig={sig}")
+    return "; ".join(parts)
+
 def extract_cookie(raw: str):
     """提取 Cookie，支持 Cookie-Editor 冒号格式"""
     if not raw:
         return None
     raw = raw.strip()
 
-    # Cookie-Editor 格式 (koa:sess=xxx; koa:sess.sig=yyy)
-    if 'koa:sess=' in raw or 'koa:sess.sig=' in raw:
-        return raw
+    # 已经是 Cookie 串（新旧两种命名都直接放行，并补齐别名）
+    if 'koa:sess=' in raw or 'koa:sess.sig=' in raw or 'gladss=' in raw or 'gladss.sig=' in raw:
+        return with_alias(raw)
 
     # JSON
     if raw.startswith('{'):
         try:
-            return 'koa:sess=' + json.loads(raw).get('token')
+            return with_alias('koa:sess=' + json.loads(raw).get('token'))
         except Exception:
             pass
 
     # JWT Token
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
-        return 'koa:sess=' + raw
+        return with_alias('koa:sess=' + raw)
 
     # Standard
-    return raw
+    return with_alias(raw)
 
 def get_cookies():
     raw = os.environ.get("GLADOS_COOKIE", "")
@@ -383,8 +408,9 @@ def telegram_push(token, chat_id, title, content):
 
 COOKIE_FIX_HINT = (
     "Cookie 已失效，需要人工更新："
-    "浏览器登录 https://glados.cloud/console/checkin → F12 → Application → Cookies "
-    "→ 复制 koa:sess 与 koa:sess.sig → 拼成 \"koa:sess=…; koa:sess.sig=…\" "
+    "浏览器登录 https://glados.cloud/console/checkin（先确认页面能正常显示账号，若跳回首页说明会话已失效需重新登录）"
+    "→ F12 → Network → 刷新 → 点任意 api 请求 → Request Headers → 复制 Cookie 整行"
+    "（新版 Cookie 名为 gladss / gladss.sig，旧版为 koa:sess / koa:sess.sig，两种都支持）"
     "→ 更新仓库 Secret GLADOS_COOKIE → 手动运行一次 checkin 工作流验证"
 )
 
