@@ -55,7 +55,16 @@ RETRY_TIMES = 3          # 可重试失败的尝试次数（含首次）
 RETRY_BACKOFF = 20       # 秒，第 n 次失败后等待 n * RETRY_BACKOFF
 
 # 视为「今天已经签过」的返回文案 —— 不算失败
-ALREADY_DONE_KEYWORDS = ("Try Tomorrow", "already", "已签到", "明天")
+# 实测 2026-10-28 线上返回：Today's observation logged. Return tomorrow for more points.
+ALREADY_DONE_KEYWORDS = (
+    "Try Tomorrow",
+    "Return tomorrow",
+    "observation logged",
+    "already checked",
+    "already",
+    "已签到",
+    "明天",
+)
 
 # 视为 Cookie 失效的返回文案
 AUTH_FAIL_KEYWORDS = ("没有权限", "无权限", "unauthorized", "forbidden")
