@@ -3,6 +3,15 @@
 """
 2026 GLaDOS 自动签到 (积分增强版)
 
+v1.4.0 变更（抗瞬时网络挂起）：
+- 实测 2026-11-01 07:43 / 09:20 两次运行，三个域名同时 Read timed out（15s），
+  但同期从 runner 侧复测网络完全正常（HTTP/2 0.33s、HTTP/1.1 0.4s、接口 code=0），
+  判定为 Cloudflare 边缘对该 runner IP 的间歇性挂起，而非站点故障或 Cookie 失效
+- 请求超时由单一 15s 改为 (连接 6s, 读取 15s)，明确区分「连不上」与「连上但不回数据」
+- 重试次数 3 → 4，退避 20/40/60，覆盖更长的挂起窗口（最坏约 300s）
+- 新增 rotate_domain()：每次重试前切换首选域名，避免反复撞同一个被挂起的边缘节点
+- 失败日志补充域名与耗时，便于事后区分「慢」与「不可达」
+
 v1.3.0 变更（失败可见 + 判定修正 + 重试真正生效）：
 - 签到成败以接口返回为准：不再用「g.error 为空即成功」这种假判定
   旧逻辑下，请求彻底失败（返回 None）也会被计为成功，于是 job 永远是绿的
@@ -51,8 +60,14 @@ HEADERS = {
 }
 
 TG_MAX_LEN = 4000        # Telegram 单条上限 4096，留点余量
-RETRY_TIMES = 3          # 可重试失败的尝试次数（含首次）
-RETRY_BACKOFF = 20       # 秒，第 n 次失败后等待 n * RETRY_BACKOFF
+RETRY_TIMES = 4          # 可重试失败的尝试次数（含首次）
+RETRY_BACKOFF = 20       # 秒，第 n 次失败后等待 n * RETRY_BACKOFF（20/40/60）
+
+# 请求超时：(连接, 读取)。
+# 实测正常响应 0.3~0.5s，边缘挂起时是「连上了但不回数据」，
+# 因此读取超时取 15s —— 足够判定挂起，又不至于一次 attempt 拖太久。
+# 单次 attempt 最坏 = 3 域名 × 15s = 45s；4 次 attempt + 120s 退避 ≈ 300s。
+REQ_TIMEOUT = (6, 15)
 
 # 视为「今天已经签过」的返回文案 —— 不算失败
 # 实测 2026-10-28 线上返回：Today's observation logged. Return tomorrow for more points.
@@ -183,11 +198,21 @@ class GLaDOS:
         self.exchange_info = ""
         self.last_raw = ""
 
+    def rotate_domain(self):
+        """把首选域名切到下一个，供重试时避开被挂起的边缘节点"""
+        try:
+            i = DOMAINS.index(self.domain)
+        except ValueError:
+            i = 0
+        self.domain = DOMAINS[(i + 1) % len(DOMAINS)]
+        return self.domain
+
     def req(self, method, path, data=None):
         """带自动域名切换的请求；返回 (ok, body)。网络/5xx 视为可重试"""
         # 上次成功的域名优先，减少无谓超时
         ordered = [self.domain] + [d for d in DOMAINS if d != self.domain]
         for d in ordered:
+            t0 = time.time()
             try:
                 url = f"{d}{path}"
                 h = HEADERS.copy()
@@ -196,9 +221,9 @@ class GLaDOS:
                 h['Referer'] = f"{d}/console/checkin"
 
                 if method == 'GET':
-                    resp = requests.get(url, headers=h, timeout=15)
+                    resp = requests.get(url, headers=h, timeout=REQ_TIMEOUT)
                 else:
-                    resp = requests.post(url, headers=h, json=data, timeout=15)
+                    resp = requests.post(url, headers=h, json=data, timeout=REQ_TIMEOUT)
 
                 if resp.status_code == 200:
                     try:
@@ -210,9 +235,9 @@ class GLaDOS:
                     self.last_raw = json.dumps(body, ensure_ascii=False)[:300]
                     return True, body
 
-                log(f"⚠️ {d} HTTP {resp.status_code}: {redact(resp.text)[:120]}")
+                log(f"⚠️ {d} HTTP {resp.status_code} ({time.time()-t0:.1f}s): {redact(resp.text)[:120]}")
             except Exception as e:
-                log(f"⚠️ {d} 请求失败: {redact(e)}")
+                log(f"⚠️ {d} 请求失败 ({time.time()-t0:.1f}s): {redact(e)}")
                 continue
         return False, None
 
@@ -434,13 +459,14 @@ def checkin_with_retry(g):
             return state, msg
         if attempt < RETRY_TIMES:
             wait = RETRY_BACKOFF * attempt
-            log(f"🔁 第 {attempt} 次签到失败（{msg}），{wait}s 后重试")
+            nxt = g.rotate_domain()
+            log(f"🔁 第 {attempt} 次签到失败（{msg}），{wait}s 后重试，改用 {nxt}")
             time.sleep(wait)
     return state, msg
 
 
 def main():
-    log("🚀 2026 GLaDOS Checkin Starting... (v1.3.0)")
+    log("🚀 2026 GLaDOS Checkin Starting... (v1.4.0)")
     cookies = get_cookies()
     if not cookies:
         annotate("error", "未配置 GLADOS_COOKIE，无法签到")
