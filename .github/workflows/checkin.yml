@@ -30,6 +30,18 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
+      # v1.5.0：当日推送状态需跨运行持久化。
+      # runner 无状态，用 actions/cache 存 .state/ 目录：
+      #   key 带 run_id + run_attempt 保证每次唯一，restore-keys 前缀匹配取最近一份。
+      # cache 若被清理（7 天未访问），退化为「当日首次」，最多多推一条，不影响签到。
+      - name: 恢复当日推送状态
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: checkin-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            checkin-state-
+
       # v1.3.0 起，重试逻辑内置在 checkin.py 里（仅对网络/5xx 重试，Cookie 失效不重试），
       # 因此原来的「Retry on Failure」步骤已移除，避免同一结果被推送两次。
       # v1.4.0：单次 attempt 最坏约 45s（3 域名 × 15s），4 次 attempt + 退避 ≈ 300s，
@@ -42,3 +54,13 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # 即使签到失败（exit 1/2）也要保存状态，否则「今天已推过失败」记不住，会重复推送
+      - name: 保存当日推送状态
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: checkin-state-${{ github.run_id }}-${{ github.run_attempt }}
+

@@ -3,6 +3,14 @@
 """
 2026 GLaDOS 自动签到 (积分增强版)
 
+v1.5.0 变更（当日推送降噪）：
+- 新增当日状态记录：状态存于 .state/last_push.json，由 workflow 的 actions/cache 跨运行持久化
+- 推送门控：当日首次运行必推；同一天内结果状态翻转（ok↔fail↔auth）也推；
+  同状态重复运行不推。既避免一天三条「已签到」，也不会「早上失败推了、下午补签成功却没声音」
+- 渠道全部推送失败时不写状态，下次运行会重试，避免静默丢消息
+- 新增 PUSH_ALWAYS=1 可强制每次都推（排查用）
+- Actions Step Summary 增加「推送：已推送/已跳过（原因）」一行
+
 v1.4.0 变更（抗瞬时网络挂起）：
 - 实测 2026-11-01 07:43 / 09:20 两次运行，三个域名同时 Read timed out（15s），
   但同期从 runner 侧复测网络完全正常（HTTP/2 0.33s、HTTP/1.1 0.4s、接口 code=0），
@@ -89,6 +97,14 @@ EXIT_OK = 0
 EXIT_RETRYABLE = 1
 EXIT_FATAL = 2
 
+# ===== 当日推送状态（降噪）=====
+# 状态文件由 workflow 的 actions/cache 持久化到 .state/ 目录。
+# 语义：当日首次运行必推；同一天内结果状态发生翻转也推；同状态重复运行不推。
+# 这样既不会一天三条「已签到」，也不会「早上失败推送了、下午补签成功却没声音」。
+STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".state")
+STATE_FILE = os.path.join(STATE_DIR, "last_push.json")
+PUSH_ALWAYS = os.environ.get("PUSH_ALWAYS", "").strip().lower() in ("1", "true", "yes")
+
 # ================= 工具函数 =================
 
 def log(msg):
@@ -117,6 +133,56 @@ def summary(markdown):
             f.write(markdown + "\n")
     except Exception:
         pass
+
+# ===== 当日推送状态：读写与判定 =====
+
+def _today_cn():
+    """以北京时间取日期。runner 默认 UTC，跨零点时会差一天"""
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+def _now_cn():
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+def load_push_state():
+    """读取上次推送状态；文件缺失/损坏一律视为空，退化为「当日首次」"""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_push_state(state):
+    """记录「今天已经推送过哪种状态」。写失败不影响签到主流程"""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({
+                "date": _today_cn(),
+                "pushed_state": state,
+                "pushed_at": _now_cn(),
+            }, fh, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"⚠️ 状态文件写入失败（不影响签到）：{redact(e)}")
+
+def push_decision(state):
+    """判定本次是否需要推送。返回 (bool, 原因说明)
+
+    - 当日首次运行 → 推
+    - 当日结果状态与上次推送的不同（ok↔fail↔auth）→ 推
+    - 同状态重复 → 不推
+    """
+    if PUSH_ALWAYS:
+        return True, "PUSH_ALWAYS=1，强制推送"
+    st = load_push_state()
+    today = _today_cn()
+    prev_date = st.get("date")
+    prev_state = st.get("pushed_state")
+    if prev_date != today:
+        return True, f"当日首次运行（{today}，上次记录 {prev_date or '无'}）"
+    if prev_state != state:
+        return True, f"状态变化：{prev_state} → {state}"
+    return False, f"当日已推送过相同状态（{state}，{st.get('pushed_at', '?')}），本次跳过"
 
 def with_alias(cookie: str) -> str:
     """同一会话值同时以三种命名发送，兼容 GLaDOS 各版本的服务端
@@ -466,7 +532,7 @@ def checkin_with_retry(g):
 
 
 def main():
-    log("🚀 2026 GLaDOS Checkin Starting... (v1.4.0)")
+    log("🚀 2026 GLaDOS Checkin Starting... (v1.5.0)")
     cookies = get_cookies()
     if not cookies:
         annotate("error", "未配置 GLADOS_COOKIE，无法签到")
@@ -557,10 +623,25 @@ def main():
     content += f"<br><small>时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}</small>"
 
     outcome = {}
-    if has_pp:
-        outcome["PushPlus"] = pushplus(ptoken, title, content)
-    if has_tg:
-        outcome["Telegram"] = telegram_push(tg_token, tg_chat_id, title, content)
+    overall = "auth" if auth_failed else ("ok" if all_ok else "fail")
+    need_push, why = push_decision(overall)
+    push_note = ""
+
+    if need_push:
+        log(f"📮 推送判定：{why}")
+        if has_pp:
+            outcome["PushPlus"] = pushplus(ptoken, title, content)
+        if has_tg:
+            outcome["Telegram"] = telegram_push(tg_token, tg_chat_id, title, content)
+        if any(v for v in outcome.values()):
+            save_push_state(overall)
+            push_note = f"已推送（{why}）"
+        else:
+            push_note = "推送渠道全部失败，未记录当日状态，下次运行会重试"
+            log(f"⚠️ {push_note}")
+    else:
+        log(f"⏭️ {why}")
+        push_note = f"已跳过（{why}）"
 
     # ===== 结果汇总：写进 Actions 摘要，失败直接报错 =====
     lines = [
@@ -570,6 +651,8 @@ def main():
     ]
     if auth_failed:
         lines.append("- ❌ **Cookie 已失效**，本次签到无效，需人工更新 Secret `GLADOS_COOKIE`")
+    if push_note:
+        lines.append(f"- 推送：{push_note}")
     for name, ok in outcome.items():
         lines.append(f"- {name} 推送：{'✅ 成功' if ok else '❌ 失败'}")
         if not ok:
