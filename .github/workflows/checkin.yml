@@ -9,6 +9,11 @@ on:
     # 北京时间 21:30 (UTC 13:30)
     - cron: '30 13 * * *'
   workflow_dispatch:  # 允许手动触发
+    inputs:
+      force_push:
+        description: '强制推送本次结果（换 Cookie 后验证用，绕过当日降噪）'
+        type: boolean
+        default: false
   push:
     branches: [main]  # 推送时也触发，保持活跃
 
@@ -59,6 +64,9 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 手动触发时勾选「强制推送」→ 绕过当日降噪，验证换 Cookie 后是否真的生效。
+          # schedule / push 触发时 inputs 为空，渲染成空串，脚本判为 False，不影响日常降噪。
+          PUSH_ALWAYS: ${{ inputs.force_push }}
 
       # 即使签到失败（exit 1/2）也要保存状态，否则「今天已推过失败」记不住，会重复推送
       - name: 保存当日推送状态
