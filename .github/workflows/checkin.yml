@@ -12,6 +12,11 @@ on:
   push:
     branches: [main]  # 推送时也触发，保持活跃
 
+# 串行化：push 触发与 schedule 同时到来时，若并发执行会都读到旧状态而重复推送
+concurrency:
+  group: glados-checkin
+  cancel-in-progress: false
+
 jobs:
   checkin:
     runs-on: ubuntu-latest
