@@ -1,81 +1,70 @@
 name: GLaDOS 2026 Checkin
 
 # ⚠️ 已停用自动签到（2026-11-08），改用 Hark AI 助手签到
-# schedule / push 触发器已全部注释，仅保留手动触发
+# schedule 触发器已注释，仅保留手动触发
 on:
   # schedule:
-  #   # 北京时间 9:30 (UTC 1:30)
+  #   # 北京时间 09:30（UTC 01:30）。一天一次即可，脚本会在失败时自动重试。
   #   - cron: '30 1 * * *'
-  #   # 北京时间 15:30 (UTC 7:30) —— 兜底：早间那次若遇边缘节点挂起，这次补签
-  #   - cron: '30 7 * * *'
-  #   # 北京时间 21:30 (UTC 13:30)
-  #   - cron: '30 13 * * *'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
     inputs:
-      force_push:
-        description: '强制推送本次结果（换 Cookie 后验证用，绕过当日降噪）'
-        type: boolean
+      dispatch_source:
+        description: 手动运行请选择 manual；外部定时器可不填（默认按 external）
+        required: false
+        default: external
+        type: choice
+        options:
+          - manual
+          - external
+      diagnose_only:
+        description: 只检查 Cookie 是否可读取账号状态，不签到、不兑换、不推送
+        required: false
         default: false
-  # push:
-  #   branches: [main]  # 推送时也触发，保持活跃
+        type: boolean
 
-# 串行化：push 触发与 schedule 同时到来时，若并发执行会都读到旧状态而重复推送
 concurrency:
   group: glados-checkin
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   checkin:
+    if: github.event_name == 'schedule' || inputs.dispatch_source == 'manual' || inputs.dispatch_source == 'external'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install Dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-      # v1.5.0：当日推送状态需跨运行持久化。
-      # runner 无状态，用 actions/cache 存 .state/ 目录：
-      #   key 带 run_id + run_attempt 保证每次唯一，restore-keys 前缀匹配取最近一份。
-      # cache 若被清理（7 天未访问），退化为「当日首次」，最多多推一条，不影响签到。
-      - name: 恢复当日推送状态
-        uses: actions/cache/restore@v4
-        with:
-          path: .state
-          key: checkin-state-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            checkin-state-
+      - name: Run Tests
+        run: python -m unittest discover -s tests -v
 
-      # v1.3.0 起，重试逻辑内置在 checkin.py 里（仅对网络/5xx 重试，Cookie 失效不重试），
-      # 因此原来的「Retry on Failure」步骤已移除，避免同一结果被推送两次。
-      # v1.4.0：单次 attempt 最坏约 45s（3 域名 × 15s），4 次 attempt + 退避 ≈ 300s，
-      #         故本步骤时限由 5 分钟放宽到 9 分钟。
       - name: Run Checkin
         run: python checkin.py
-        timeout-minutes: 9
+        timeout-minutes: 8
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
+          # Must match the browser that created the current gld:sess.
+          # Prefer the repository Variable; accept a same-named Secret for compatibility.
+          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT }}
+          CHECKIN_DIAGNOSTIC_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 手动触发时勾选「强制推送」→ 绕过当日降噪，验证换 Cookie 后是否真的生效。
-          # schedule / push 触发时 inputs 为空，渲染成空串，脚本判为 False，不影响日常降噪。
-          PUSH_ALWAYS: ${{ inputs.force_push }}
-
-      # 即使签到失败（exit 1/2）也要保存状态，否则「今天已推过失败」记不住，会重复推送
-      - name: 保存当日推送状态
-        if: always()
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: checkin-state-${{ github.run_id }}-${{ github.run_attempt }}
-
+          PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'fail_only' }}
+          EXCHANGE_PLAN: ${{ vars.EXCHANGE_PLAN || 'plan500' }}
+          CHECKIN_MAX_ATTEMPTS: '3'
+          CHECKIN_RETRY_DELAY_SECONDS: '60'
