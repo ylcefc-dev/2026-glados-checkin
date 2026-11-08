@@ -1,9 +1,10 @@
 name: Keep Repository Active
 
-# 每天 UTC 0:00（北京 8:00）运行
+# ⚠️ 已停用自动保活（2026-11-08），GlaDOS 签到已切换至 Hark AI
+# schedule 触发器已注释，仅保留手动触发
 on:
-  schedule:
-    - cron: '0 0 * * *'
+  # schedule:
+  #   - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
