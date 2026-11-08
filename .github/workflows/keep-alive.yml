@@ -1,10 +1,10 @@
 name: Keep Scheduled Workflows Active
 
-# ⚠️ 已停用自动保活（2026-11-08），GlaDOS 签到已切换至 Hark AI
-# schedule 触发器已注释，仅保留手动触发
+# GitHub 会在公开仓库连续 60 天无活动后停用 schedule。
+# 每月提交一次时间戳即可，无需每天制造提交。
 on:
-  # schedule:
-  #   - cron: '23 3 1 * *'
+  schedule:
+    - cron: '23 3 1 * *'
   workflow_dispatch:
 
 concurrency:
